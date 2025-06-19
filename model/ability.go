@@ -5,11 +5,22 @@ import (
 	"fmt"
 	"one-api/common"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/samber/lo"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+var (
+	dbRoundRobinIndexMap map[string]*uint64
+	dbRoundRobinMutex    sync.Mutex
+)
+
+func InitDBRoundRobin() {
+	dbRoundRobinIndexMap = make(map[string]*uint64)
+}
 
 type Ability struct {
 	Group     string  `json:"group" gorm:"type:varchar(64);primaryKey;autoIncrement:false"`
@@ -87,40 +98,48 @@ func getChannelQuery(group string, model string, retry int) *gorm.DB {
 }
 
 func GetRandomSatisfiedChannel(group string, model string, retry int) (*Channel, error) {
-	var abilities []Ability
-
-	var err error = nil
 	channelQuery := getChannelQuery(group, model, retry)
-	if common.UsingSQLite || common.UsingPostgreSQL {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	} else {
-		err = channelQuery.Order("weight DESC").Find(&abilities).Error
-	}
+	var abilities []Ability
+	err := channelQuery.Order("weight DESC").Find(&abilities).Error
 	if err != nil {
 		return nil, err
 	}
-	channel := Channel{}
-	if len(abilities) > 0 {
-		// Randomly choose one
-		weightSum := uint(0)
-		for _, ability_ := range abilities {
-			weightSum += ability_.Weight + 10
-		}
-		// Randomly choose one
-		weight := common.GetRandomInt(int(weightSum))
-		for _, ability_ := range abilities {
-			weight -= int(ability_.Weight) + 10
-			//log.Printf("weight: %d, ability weight: %d", weight, *ability_.Weight)
-			if weight <= 0 {
-				channel.Id = ability_.ChannelId
-				break
-			}
-		}
-	} else {
+	if len(abilities) == 0 {
 		return nil, errors.New("channel not found")
 	}
-	err = DB.First(&channel, "id = ?", channel.Id).Error
-	return &channel, err
+
+	var weightedChannels []*Channel
+	for _, ability := range abilities {
+		channel, err := GetChannelById(ability.ChannelId, false)
+		if err != nil {
+			continue
+		}
+		weight := ability.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		for i := 0; i < int(weight); i++ {
+			weightedChannels = append(weightedChannels, channel)
+		}
+	}
+
+	if len(weightedChannels) == 0 {
+		return nil, errors.New("no available channels")
+	}
+
+	// Get the round-robin index
+	key := fmt.Sprintf("%s-%s-%d", group, model, retry)
+	dbRoundRobinMutex.Lock()
+	if _, ok := dbRoundRobinIndexMap[key]; !ok {
+		var i uint64 = 0
+		dbRoundRobinIndexMap[key] = &i
+	}
+	indexPtr := dbRoundRobinIndexMap[key]
+	dbRoundRobinMutex.Unlock()
+
+	nextIndex := atomic.AddUint64(indexPtr, 1) - 1
+	channel := weightedChannels[int(nextIndex%uint64(len(weightedChannels)))]
+	return channel, nil
 }
 
 func (channel *Channel) AddAbilities() error {
