@@ -259,7 +259,7 @@ func getChannel(c *gin.Context, group, originalModel string, retryCount int) (*m
 			AutoBan: &autoBanInt,
 		}, nil
 	}
-	channel, _, err := model.CacheGetRandomSatisfiedChannel(c, group, originalModel, retryCount)
+	channel, _, err := model.CacheGetNextSatisfiedChannel(c, group, originalModel, retryCount)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("获取重试渠道失败: %s", err.Error()))
 	}
@@ -388,9 +388,9 @@ func RelayTask(c *gin.Context) {
 		retryTimes = 0
 	}
 	for i := 0; shouldRetryTaskRelay(c, channelId, taskErr, retryTimes) && i < retryTimes; i++ {
-		channel, _, err := model.CacheGetRandomSatisfiedChannel(c, group, originalModel, i)
+		channel, _, err := model.CacheGetNextSatisfiedChannel(c, group, originalModel, i)
 		if err != nil {
-			common.LogError(c, fmt.Sprintf("CacheGetRandomSatisfiedChannel failed: %s", err.Error()))
+			common.LogError(c, fmt.Sprintf("CacheGetNextSatisfiedChannel failed: %s", err.Error()))
 			break
 		}
 		channelId = channel.Id

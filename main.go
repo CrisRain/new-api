@@ -79,7 +79,6 @@ func main() {
 	constant.InitEnv()
 	// Initialize options
 	model.InitOptionMap()
-	model.InitDBRoundRobin()
 
 	service.InitTokenEncoders()
 

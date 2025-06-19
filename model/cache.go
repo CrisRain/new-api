@@ -8,69 +8,66 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-var (
-	// group -> model -> priority -> list of channels
-	group2model2priority2channels map[string]map[string]map[int64][]*Channel
-	// group -> model -> priority -> round robin index
-	group2model2priority2roundRobinIndex map[string]map[string]map[int64]*uint64
-	// channel id -> channel
-	channelsIDM map[int]*Channel
-	// sync lock
-	channelSyncLock sync.RWMutex
-)
+var group2model2channels map[string]map[string][]*Channel
+var channelsIDM map[int]*Channel
+var channelSyncLock sync.RWMutex
+var groupModelRoundRobinIndex map[string]int
+var roundRobinLock sync.Mutex
 
 func InitChannelCache() {
 	if !common.MemoryCacheEnabled {
 		return
 	}
-	newChannelsIDM := make(map[int]*Channel)
-	newGroup2model2priority2channels := make(map[string]map[string]map[int64][]*Channel)
-	newGroup2model2priority2roundRobinIndex := make(map[string]map[string]map[int64]*uint64)
-
+	newChannelId2channel := make(map[int]*Channel)
 	var channels []*Channel
 	DB.Where("status = ?", common.ChannelStatusEnabled).Find(&channels)
 	for _, channel := range channels {
+		newChannelId2channel[channel.Id] = channel
+	}
+	var abilities []*Ability
+	DB.Find(&abilities)
+	groups := make(map[string]bool)
+	for _, ability := range abilities {
+		groups[ability.Group] = true
+	}
+	newGroup2model2channels := make(map[string]map[string][]*Channel)
+	newChannelsIDM := make(map[int]*Channel)
+	for group := range groups {
+		newGroup2model2channels[group] = make(map[string][]*Channel)
+	}
+	for _, channel := range channels {
 		newChannelsIDM[channel.Id] = channel
 		groups := strings.Split(channel.Group, ",")
-		models := strings.Split(channel.Models, ",")
 		for _, group := range groups {
-			if _, ok := newGroup2model2priority2channels[group]; !ok {
-				newGroup2model2priority2channels[group] = make(map[string]map[int64][]*Channel)
-				newGroup2model2priority2roundRobinIndex[group] = make(map[string]map[int64]*uint64)
-			}
+			models := strings.Split(channel.Models, ",")
 			for _, model := range models {
-				if _, ok := newGroup2model2priority2channels[group][model]; !ok {
-					newGroup2model2priority2channels[group][model] = make(map[int64][]*Channel)
-					newGroup2model2priority2roundRobinIndex[group][model] = make(map[int64]*uint64)
+				if _, ok := newGroup2model2channels[group][model]; !ok {
+					newGroup2model2channels[group][model] = make([]*Channel, 0)
 				}
-				priority := channel.GetPriority()
-				if _, ok := newGroup2model2priority2channels[group][model][priority]; !ok {
-					newGroup2model2priority2channels[group][model][priority] = make([]*Channel, 0)
-					var i uint64 = 0
-					newGroup2model2priority2roundRobinIndex[group][model][priority] = &i
-				}
-				// Append channel based on its weight
-				weight := channel.GetWeight()
-				if weight <= 0 {
-					weight = 1
-				}
-				for i := 0; i < weight; i++ {
-					newGroup2model2priority2channels[group][model][priority] = append(newGroup2model2priority2channels[group][model][priority], channel)
-				}
+				newGroup2model2channels[group][model] = append(newGroup2model2channels[group][model], channel)
 			}
 		}
 	}
 
+	// sort by priority
+	for group, model2channels := range newGroup2model2channels {
+		for model, channels := range model2channels {
+			sort.Slice(channels, func(i, j int) bool {
+				return channels[i].GetPriority() > channels[j].GetPriority()
+			})
+			newGroup2model2channels[group][model] = channels
+		}
+	}
+
 	channelSyncLock.Lock()
+	group2model2channels = newGroup2model2channels
 	channelsIDM = newChannelsIDM
-	group2model2priority2channels = newGroup2model2priority2channels
-	group2model2priority2roundRobinIndex = newGroup2model2priority2roundRobinIndex
+	groupModelRoundRobinIndex = make(map[string]int)
 	channelSyncLock.Unlock()
 	common.SysLog("channels synced from database")
 }
@@ -83,7 +80,7 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
-func CacheGetRandomSatisfiedChannel(c *gin.Context, group string, model string, retry int) (*Channel, string, error) {
+func CacheGetNextSatisfiedChannel(c *gin.Context, group string, model string, retry int) (*Channel, string, error) {
 	var channel *Channel
 	var err error
 	selectGroup := group
@@ -95,7 +92,7 @@ func CacheGetRandomSatisfiedChannel(c *gin.Context, group string, model string, 
 			if common.DebugEnabled {
 				println("autoGroup:", autoGroup)
 			}
-			channel, _ = getRandomSatisfiedChannel(autoGroup, model, retry)
+			channel, _ = getNextSatisfiedChannel(autoGroup, model, retry)
 			if channel == nil {
 				continue
 			} else {
@@ -108,7 +105,7 @@ func CacheGetRandomSatisfiedChannel(c *gin.Context, group string, model string, 
 			}
 		}
 	} else {
-		channel, err = getRandomSatisfiedChannel(group, model, retry)
+		channel, err = getNextSatisfiedChannel(group, model, retry)
 		if err != nil {
 			return nil, group, err
 		}
@@ -119,50 +116,62 @@ func CacheGetRandomSatisfiedChannel(c *gin.Context, group string, model string, 
 	return channel, selectGroup, nil
 }
 
-func getRandomSatisfiedChannel(group string, model string, retry int) (*Channel, error) {
+func getNextSatisfiedChannel(group string, model string, retry int) (*Channel, error) {
 	if strings.HasPrefix(model, "gpt-4-gizmo") {
 		model = "gpt-4-gizmo-*"
 	}
 	if strings.HasPrefix(model, "gpt-4o-gizmo") {
 		model = "gpt-4o-gizmo-*"
 	}
+
+	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
+		// this function is only for memory cache
 		return GetRandomSatisfiedChannel(group, model, retry)
 	}
+
 	channelSyncLock.RLock()
-	defer channelSyncLock.RUnlock()
+	channels := group2model2channels[group][model]
+	channelSyncLock.RUnlock()
 
-	priority2channels, ok := group2model2priority2channels[group][model]
-	if !ok {
-		return nil, errors.New("channel not found for group and model")
-	}
-
-	var priorities []int64
-	for p := range priority2channels {
-		priorities = append(priorities, p)
-	}
-	sort.Slice(priorities, func(i, j int) bool {
-		return priorities[i] > priorities[j]
-	})
-
-	if len(priorities) == 0 {
-		return nil, errors.New("no available priorities")
-	}
-	if retry >= len(priorities) {
-		retry = len(priorities) - 1
-	}
-	targetPriority := priorities[retry]
-	weightedChannels := priority2channels[targetPriority]
-	if len(weightedChannels) == 0 {
-		return nil, errors.New("no channels for the selected priority")
+	if len(channels) == 0 {
+		return nil, errors.New("channel not found")
 	}
 
-	// Get the round-robin index for the current priority
-	indexPtr := group2model2priority2roundRobinIndex[group][model][targetPriority]
-	// Use atomic operation to get the next index in a thread-safe way
-	nextIndex := atomic.AddUint64(indexPtr, 1) - 1
-	// Get the channel using weighted round-robin
-	channel := weightedChannels[int(nextIndex%uint64(len(weightedChannels)))]
+	uniquePriorities := make(map[int]bool)
+	for _, channel := range channels {
+		uniquePriorities[int(channel.GetPriority())] = true
+	}
+	var sortedUniquePriorities []int
+	for priority := range uniquePriorities {
+		sortedUniquePriorities = append(sortedUniquePriorities, priority)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
+
+	if retry >= len(uniquePriorities) {
+		retry = len(uniquePriorities) - 1
+	}
+	targetPriority := int64(sortedUniquePriorities[retry])
+
+	// get the priority for the given retry number
+	var targetChannels []*Channel
+	for _, channel := range channels {
+		if channel.GetPriority() == targetPriority {
+			targetChannels = append(targetChannels, channel)
+		}
+	}
+
+	if len(targetChannels) == 0 {
+		return nil, errors.New("channel not found")
+	}
+
+	// Round-robin
+	roundRobinLock.Lock()
+	defer roundRobinLock.Unlock()
+	key := fmt.Sprintf("%s:%s:%d", group, model, targetPriority)
+	index := groupModelRoundRobinIndex[key]
+	channel := targetChannels[index%len(targetChannels)]
+	groupModelRoundRobinIndex[key] = (index + 1) % len(targetChannels)
 	return channel, nil
 }
 

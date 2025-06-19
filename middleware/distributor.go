@@ -99,7 +99,7 @@ func Distribute() func(c *gin.Context) {
 
 			if shouldSelectChannel {
 				var selectGroup string
-				channel, selectGroup, err = model.CacheGetRandomSatisfiedChannel(c, userGroup, modelRequest.Model, 0)
+				channel, selectGroup, err = model.CacheGetNextSatisfiedChannel(c, userGroup, modelRequest.Model, 0)
 				if err != nil {
 					showGroup := userGroup
 					if userGroup == "auto" {
