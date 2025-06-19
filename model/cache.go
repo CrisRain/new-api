@@ -165,13 +165,25 @@ func getNextSatisfiedChannel(group string, model string, retry int) (*Channel, e
 		return nil, errors.New("channel not found")
 	}
 
-	// Round-robin
+	// Weighted round-robin
+	var weightedChannels []*Channel
+	for _, channel := range targetChannels {
+		// Treat weight 0 as 1 to ensure all channels have a chance to be selected
+		weight := channel.GetWeight()
+		if weight < 1 {
+			weight = 1
+		}
+		for i := 0; i < weight; i++ {
+			weightedChannels = append(weightedChannels, channel)
+		}
+	}
+
 	roundRobinLock.Lock()
 	defer roundRobinLock.Unlock()
 	key := fmt.Sprintf("%s:%s:%d", group, model, targetPriority)
 	index := groupModelRoundRobinIndex[key]
-	channel := targetChannels[index%len(targetChannels)]
-	groupModelRoundRobinIndex[key] = (index + 1) % len(targetChannels)
+	channel := weightedChannels[index%len(weightedChannels)]
+	groupModelRoundRobinIndex[key] = (index + 1) % len(weightedChannels)
 	return channel, nil
 }
 
